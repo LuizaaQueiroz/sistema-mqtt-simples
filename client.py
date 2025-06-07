@@ -1,31 +1,20 @@
 import socket
 import base64
 import threading
-
-from utils.crypto_utils import (
-    carregar_chave_publica,
-    gerar_chave_aes,
-    criptografar_rsa,
-    criptografar_aes,
-    descriptografar_aes
-)
+import json
+import os
 
 # Configurações
 BROKER_HOST = 'localhost'
-BROKER_PORT = 8888
-CLIENT_CERT_PATH = 'certs/client_cert.pem'
-BROKER_CERT_PATH = 'certs/broker_cert.pem'
+BROKER_PORT = 1883
+CHAVE_PUB_PATH = 'certs/client_pub.pem'
 
 class ClienteWeb:
     def __init__(self):
         self.socket = None
-        self.aes_key = None
         self.mensagens = []
         self.conectado = False
-
-    def carregar_certificado_base64(self, path):
-        with open(path, 'rb') as cert_file:
-            return base64.b64encode(cert_file.read()).decode()
+        self.nome_cliente = ""
 
     def receber_mensagens(self):
         while True:
@@ -33,49 +22,58 @@ class ClienteWeb:
                 data = self.socket.recv(4096)
                 if not data:
                     break
-                prefixo_fim = data.find(b':') + 1
-                if prefixo_fim <= 0:
-                    continue
-                prefixo = data[:prefixo_fim].decode(errors="ignore")
-                payload = data[prefixo_fim:]
-                msg = descriptografar_aes(payload, self.aes_key)
-                self.mensagens.append(f"{prefixo.strip()} {msg}")
+                pacote = json.loads(data.decode())
+                if pacote.get("tipo") == "mensagem":
+                    topico = pacote.get("topico")
+                    mensagem = pacote.get("mensagem")
+                    self.mensagens.append(f"[{topico}] {mensagem}")
             except:
                 break
 
-    def conectar(self):
+    def conectar(self, nome_cliente):
         try:
+            self.nome_cliente = nome_cliente
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.connect((BROKER_HOST, BROKER_PORT))
 
-            # Envia AUTH
-            cert_b64 = self.carregar_certificado_base64(CLIENT_CERT_PATH)
-            self.socket.sendall(f"AUTH:{cert_b64}".encode())
-            resposta = self.socket.recv(4096).decode()
-            if resposta.strip() != "AUTH_OK":
-                return False, "Falha na autenticação."
+            print("[⚠️] Verificação de certificado ignorada temporariamente.")
 
-            # Envia KEY
-            self.aes_key = gerar_chave_aes()
-            chave_pub = carregar_chave_publica(BROKER_CERT_PATH)
-            chave_aes_cripto = criptografar_rsa(self.aes_key, chave_pub)
-            self.socket.sendall(f"KEY:{base64.b64encode(chave_aes_cripto).decode()}".encode())
+            # Envia identificador + chave pública
+            with open(CHAVE_PUB_PATH, 'rb') as f:
+                chave_pub_pem = f.read().decode()
+
+            pacote_auth = json.dumps({
+                "tipo": "autenticacao",
+                "id": self.nome_cliente,
+                "chave_publica": chave_pub_pem
+            })
+            self.socket.send(pacote_auth.encode())
+
+            resposta = self.socket.recv(1024).decode()
+            if resposta.strip() != "AUTENTICADO":
+                return False, "Broker recusou autenticação do cliente."
 
             self.conectado = True
             threading.Thread(target=self.receber_mensagens, daemon=True).start()
-            return True, "Autenticado com sucesso."
+            return True, "Conectado com sucesso ao broker."
 
         except Exception as e:
             return False, f"Erro ao conectar: {e}"
 
     def enviar_sub(self, topico):
         if self.conectado:
-            self.socket.send(f"SUB:{topico}".encode())
+            pacote = json.dumps({"tipo": "inscrever", "topico": topico, "id": self.nome_cliente})
+            self.socket.send(pacote.encode())
 
     def enviar_pub(self, topico, mensagem):
         if self.conectado:
             try:
-                msg_cript = criptografar_aes(mensagem, self.aes_key)
-                self.socket.send(f"PUB:{topico}:".encode() + msg_cript)
+                pacote = json.dumps({
+                    "tipo": "publicar",
+                    "topico": topico,
+                    "mensagem": mensagem,
+                    "id": self.nome_cliente
+                })
+                self.socket.send(pacote.encode())
             except Exception as e:
-                raise Exception("Erro ao criptografar ou enviar mensagem: " + str(e))
+                raise Exception("Erro ao enviar mensagem: " + str(e))

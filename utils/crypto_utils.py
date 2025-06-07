@@ -38,14 +38,6 @@ def descriptografar_aes(msg_cript, chave):
     decryptor = cipher.decryptor()
     return decryptor.update(conteudo).decode()
 
-def carregar_chave_publica(path):
-    with open(path, "rb") as f:
-        return serialization.load_pem_public_key(f.read(), backend=default_backend())
-
-def carregar_chave_privada(path):
-    with open(path, "rb") as f:
-        return serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
-
 def criptografar_rsa(chave_simetrica, chave_publica):
     return chave_publica.encrypt(
         chave_simetrica,
@@ -56,15 +48,22 @@ def criptografar_rsa(chave_simetrica, chave_publica):
         )
     )
 
-def descriptografar_rsa(chave_criptografada, chave_privada):
-    return chave_privada.decrypt(
-        chave_criptografada,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    )
-
 def gerar_chave_aes():
-    return os.urandom(32)  
+    return os.urandom(32)
+
+def carregar_certificado_broker():
+    with open("certs/broker_cert.pem", "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+def enviar_certificado_broker(conn):
+    cert_base64 = carregar_certificado_broker()
+    conn.send(cert_base64.encode())
+
+def enviar_mensagem(conn, topico, mensagem):
+    import json
+    pacote = {
+        "tipo": "mensagem",
+        "topico": topico,
+        "mensagem": mensagem
+    }
+    conn.send(json.dumps(pacote).encode())

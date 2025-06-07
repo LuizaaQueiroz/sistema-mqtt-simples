@@ -1,114 +1,86 @@
+# ============================
+# Arquivo: broker.py
+# ============================
 import socket
 import threading
-import base64
+import json
+import os
 
-from utils.crypto_utils import (
-    load_cert_from_base64,
-    load_ca_cert,
-    verify_certificate,
-    carregar_chave_privada,
-    descriptografar_rsa
-)
+BROKER_HOST = '127.0.0.1'
+BROKER_PORT = 1883
 
-from cryptography.x509.oid import NameOID
+clientes_conectados = {}   # chave: id_cliente, valor: socket
+subscricoes = {}           # chave: topico, valor: lista de id_cliente
 
-# Estruturas de dados globais
-topicos = {}           # {"chat": [conn1, conn2], ...}
-clientes_aes = {}      # {conn: chave_aes}
-clientes_nomes = {}    # {conn: nome_cliente (CN do certificado)}
+# Certifique-se de que o diretório para chaves existe
+os.makedirs("chaves", exist_ok=True)
 
+def enviar_mensagem(conn, topico, mensagem):
+    pacote = {
+        "tipo": "mensagem",
+        "topico": topico,
+        "mensagem": mensagem
+    }
+    conn.send(json.dumps(pacote).encode())
 
-def handle_client(conn, addr):
-    print(f"[+] Conexão de {addr}")
-
+def tratar_cliente(conn, addr):
     try:
-        # 1. Autenticação: espera AUTH:<certificado em base64>
-        data = conn.recv(4096).decode()
-        if data.startswith("AUTH:"):
-            cert_b64 = data.split("AUTH:")[1]
-            client_cert = load_cert_from_base64(cert_b64)
-            ca_cert = load_ca_cert()
+        print(f"[+] Conexao de {addr}")
 
-            if verify_certificate(client_cert, ca_cert):
-                conn.send("AUTH_OK\n".encode)
-                nome_cliente = client_cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-                clientes_nomes[conn] = nome_cliente  # salva nome para rastrear
-                print(f"[+] Cliente autenticado: {nome_cliente}")
-            else:
-                conn.send("AUTH_FAIL\n".encode)
-                conn.close()
-                return
-        else:
-            conn.send("ERRO: Primeiro comando deve ser AUTH\n".encode)
-            conn.close()
-            return
+        dados_iniciais = conn.recv(4096).decode()
+        print("[RECEBIDO DO CLIENTE]", dados_iniciais)
+        pacote = json.loads(dados_iniciais)
 
-        # 2. Recebe a chave AES criptografada via RSA
-        data = conn.recv(4096).decode()
-        if data.startswith("KEY:"):
-            chave_cripto = base64.b64decode(data[4:])
-            chave_privada = carregar_chave_privada("certs/broker_key.pem")
-            chave_aes = descriptografar_rsa(chave_cripto, chave_privada)
-            clientes_aes[conn] = chave_aes
-            print(f"[+] Chave AES recebida de {clientes_nomes[conn]}")
-        else:
-            conn.send("ERRO: Esperado comando KEY após AUTH\n".encode())
+        if pacote['tipo'] == 'autenticacao':
+            id_cliente = pacote['id']
+            chave_publica = pacote.get('chave_publica', '')
 
-            conn.close()
-            return
+            # Salva chave pública do cliente
+            if chave_publica:
+                with open(f"chaves/{id_cliente}.pem", "w") as f:
+                    f.write(chave_publica)
+                print(f"[✓] Chave de {id_cliente} salva em chaves/{id_cliente}.pem")
 
-        # 3. Espera comandos SUB:<topico> ou PUB:<topico>:<mensagem criptografada>
+            print(f"[✓] Cliente {id_cliente} conectado")
+            clientes_conectados[id_cliente] = conn
+            conn.send(b"AUTENTICADO")
+
         while True:
-            data = conn.recv(4096)
-            if not data:
+            dados = conn.recv(4096)
+            if not dados:
                 break
 
-            try:
-                msg = data.decode(errors="ignore")
-            except:
-                msg = ""
+            pacote = json.loads(dados.decode())
+            tipo = pacote.get('tipo')
+            id_cliente = pacote.get('id')
 
-            if msg.startswith("SUB:"):
-                topico = msg.split("SUB:")[1].strip()
-                topicos.setdefault(topico, []).append(conn)
-                print(f"[Broker] {clientes_nomes[conn]} assinou o tópico '{topico}'")
+            if tipo == 'publicar':
+                topico = pacote['topico']
+                payload = pacote['mensagem']
 
-            elif msg.startswith("PUB:"):
-                try:
-                    partes = msg.split(":", 2)
-                    topico = partes[1]
-                    payload = partes[2].encode()
+                for sub_id in subscricoes.get(topico, []):
+                    if sub_id != id_cliente and sub_id in clientes_conectados:
+                        enviar_mensagem(clientes_conectados[sub_id], topico, payload)
 
-                    print(f"[Broker] {clientes_nomes[conn]} publicou em '{topico}'")
-
-                    for cliente in topicos.get(topico, []):
-                        if cliente != conn:
-                            cliente.send(f"MSG:{topico}:".encode() + payload)
-                except Exception as e:
-                    print("[ERRO] Falha ao processar PUB:", e)
+            elif tipo == 'inscrever':
+                topico = pacote['topico']
+                subscricoes.setdefault(topico, []).append(id_cliente)
+                print(f"[+] {id_cliente} inscrito em {topico}")
 
     except Exception as e:
-        print(f"[ERRO] Cliente {addr} desconectado: {e}")
-
+        print(f"[!] Erro com cliente {addr}: {e}")
     finally:
-        if conn in clientes_nomes:
-            print(f"[Broker] Desconectado: {clientes_nomes[conn]}")
-            del clientes_nomes[conn]
-        if conn in clientes_aes:
-            del clientes_aes[conn]
         conn.close()
 
-
-def main():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(('localhost', 8888))
-    server.listen(5)
-    print("[Broker] Aguardando conexões...")
+def iniciar_broker():
+    servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    servidor.bind((BROKER_HOST, BROKER_PORT))
+    servidor.listen(5)
+    print(f"[*] Broker ouvindo em {BROKER_HOST}:{BROKER_PORT}")
 
     while True:
-        conn, addr = server.accept()
-        threading.Thread(target=handle_client, args=(conn, addr)).start()
+        conn, addr = servidor.accept()
+        threading.Thread(target=tratar_cliente, args=(conn, addr)).start()
 
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    iniciar_broker()
