@@ -2,10 +2,10 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
 # Caminho da chave privada existente
-chave_privada_path = "certs/client_key.pem"
+chave_privada_path = "certs/priv_keys/client_key.pem"
 
 # Caminho onde a chave pública será salva
-chave_publica_path = "certs/client_pub.pem"
+chave_publica_path = "certs/pub_keys/client_pub.pem"
 
 # Carrega a chave privada
 with open(chave_privada_path, "rb") as f:
@@ -27,4 +27,4 @@ with open(chave_publica_path, "wb") as f:
         )
     )
 
-print("✅ Chave pública salva em certs/client_pub.pem")
+print("✅ Chave pública salva em certs/pub_keys/client_pub.pem")

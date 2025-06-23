@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 chave = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 # Salvar chave privada em PEM
-with open("certs/client_key.pem", "wb") as f:
+with open("certs/priv_keys/broker_key.pem", "wb") as f:
     f.write(
         chave.private_bytes(
             encoding=serialization.Encoding.PEM,

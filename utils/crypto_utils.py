@@ -11,8 +11,12 @@ def load_cert_from_base64(cert_base64: str):
 
 def load_ca_cert(path="certs/ca_cert.pem"):
     with open(path, "rb") as f:
-        return x509.load_pem_x509_certificate(f.read(), default_backend())
-
+        data = f.read()
+        try:
+            return x509.load_pem_x509_certificate(data, default_backend())
+        except ValueError:
+            return x509.load_der_x509_certificate(data, default_backend())
+        
 def verify_certificate(cert, ca_cert):
     try:
         ca_cert.public_key().verify(
