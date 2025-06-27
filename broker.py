@@ -2,143 +2,137 @@ import socket
 import threading
 import json
 import os
-from datetime import datetime
+from utils.crypto_utils import (
+    enviar_mensagem,
+    carregar_certificado_broker,
+    carregar_chave_publica_pem,
+    gerar_chave_aes,
+    criptografar_aes,
+    criptografar_ec
+)
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 
-BROKER_HOST = '127.0.0.1'
+BROKER_HOST = 'localhost'
 BROKER_PORT = 1883
 
-clientes_conectados = {}        # id_cliente -> socket
-subscricoes = {}                # topico -> lista de id_cliente
-historico_topicos = {}          # topico -> lista de mensagens (strings)
-
-TOPICOS_JSON = "json/topicos.json"
-ADMINS_JSON = "json/admins.json"
-PRIVACIDADE_JSON = "json/privacidade_topicos.json"
-MEMBROS_JSON = "json/membros_topicos.json"
-
-def carregar_json(caminho):
-    if os.path.exists(caminho):
-        with open(caminho, "r") as f:
-            return json.load(f)
-    return {}
-
-def enviar_mensagem(conn, topico, mensagem):
-    pacote = {
-        "tipo": "mensagem",
-        "topico": topico,
-        "mensagem": mensagem
-    }
-    try:
-        conn.send(json.dumps(pacote).encode())
-    except:
-        pass  # Cliente pode ter desconectado
+clientes_conectados = {}  # id_cliente -> socket
+subscricoes = {}          # topico -> lista de id_cliente
 
 def tratar_cliente(conn, addr):
     id_cliente = None
     try:
         print(f"[+] Conexão de {addr}")
-
-        # Enviar certificado do broker
-        with open("certs/broker_cert.cer", "rb") as f:
-            cert_data = f.read()
-            conn.send(len(cert_data).to_bytes(4, byteorder='big'))
-            conn.send(cert_data)
-
-        dados_iniciais = conn.recv(4096).decode()
+        cert_base64 = carregar_certificado_broker()
+        conn.send(cert_base64.encode())
+        dados_iniciais = conn.recv(8192).decode()
         pacote = json.loads(dados_iniciais)
-
         if pacote['tipo'] == 'autenticacao':
             id_cliente = pacote['id']
             chave_publica = pacote.get('chave_publica', '').strip()
-            chave_path = f"certs/pub_keys/{id_cliente}.pem"
-
-            if os.path.exists(chave_path):
-                with open(chave_path, 'r') as f:
-                    chave_salva = f.read().strip()
-                if chave_publica != chave_salva:
-                    print(f"[!] Chave inválida para {id_cliente}.")
-                    conn.send(b"FALHA_AUTENTICACAO")
-                    conn.close()
-                    return
-            else:
-                with open(chave_path, "w") as f:
-                    f.write(chave_publica)
-                print(f"[✓] Chave de {id_cliente} salva.")
-
-            clientes_conectados[id_cliente] = conn
-            conn.send(b"AUTENTICADO")
+            if not chave_publica:
+                raise ValueError("Chave pública ausente no pacote de autenticação")
+            chave_path = f"certs/pub_keys/{id_cliente}_pub.pem"
+            try:
+                with open(chave_path, "wb") as f:
+                    chave_data = chave_publica.encode() if isinstance(chave_publica, str) else chave_publica
+                    f.write(chave_data)
+                # Validar a chave salva
+                with open(chave_path, "rb") as f:
+                    key = serialization.load_pem_public_key(f.read(), default_backend())
+                    print(f"[DEBUG] Chave pública de {id_cliente} carregada, tipo: {type(key)}")
+                print(f"[✓] Cliente autenticado: {id_cliente}, chave pública validada")
+                clientes_conectados[id_cliente] = conn
+                conn.send(b"AUTENTICADO")
+            except Exception as e:
+                print(f"[ERRO] Falha ao salvar ou validar chave pública de {id_cliente}: {e}")
+                conn.close()
+                return
 
         while True:
-            dados = conn.recv(4096)
+            dados = conn.recv(8192)
             if not dados:
+                print(f"[DEBUG] Conexão com {id_cliente} encerrada: sem dados recebidos")
                 break
             pacote = json.loads(dados.decode())
             tipo = pacote.get('tipo')
             id_cliente = pacote.get('id')
 
-            if tipo == 'publicar':
+            if tipo == 'inscrever':
                 topico = pacote['topico']
-                payload = pacote['mensagem']
-
-                privacidade = carregar_json(PRIVACIDADE_JSON).get(topico, "publico")
-                membros = carregar_json(MEMBROS_JSON).get(topico, [])
-                admin_topico = carregar_json(ADMINS_JSON).get(topico, "")
-
-                autorizado = False
-                if privacidade == "publico":
-                    autorizado = True
-                elif privacidade == "privado":
-                    if id_cliente == admin_topico or id_cliente in membros:
-                        autorizado = True
-
-                if autorizado:
-                    horario = datetime.now().strftime('%H:%M')
-                    mensagem_formatada = f"{id_cliente}: {payload} [{horario}]"
-
-                    # ✅ Inscreve o cliente no tópico automaticamente se ainda não estiver
-                    subscricoes.setdefault(topico, [])
-                    if id_cliente not in subscricoes[topico]:
-                        subscricoes[topico].append(id_cliente)
-
-                    # ✅ Salva no histórico
-                    historico_topicos.setdefault(topico, []).append(mensagem_formatada)
-
-                    # ✅ Envia para todos os inscritos, inclusive o próprio cliente
-                    for sub_id in subscricoes[topico]:
-                        if sub_id in clientes_conectados:
-                            enviar_mensagem(clientes_conectados[sub_id], topico, mensagem_formatada)
-
-                    print(f"[{topico}] {mensagem_formatada}")
-                else:
-                    print(f"[!] {id_cliente} tentou publicar sem permissão no tópico {topico}.")
-
-            elif tipo == 'inscrever':
-                topico = pacote['topico']
-                subscricoes.setdefault(topico, [])
-                if id_cliente not in subscricoes[topico]:
+                if id_cliente not in subscricoes.setdefault(topico, []):
                     subscricoes[topico].append(id_cliente)
                 print(f"[+] {id_cliente} inscrito em {topico}")
 
-                # Enviar histórico para o novo inscrito
-                for msg in historico_topicos.get(topico, []):
-                    enviar_mensagem(conn, topico, msg)
+            elif tipo == 'publicar':
+                topico = pacote['topico']
+                mensagem = pacote['mensagem']
+                print(f"[DEBUG] Publicando no tópico {topico}, mensagem: {mensagem}")
+                print(f"[DEBUG] Subscricoes para o tópico {topico}: {subscricoes.get(topico, [])}")
+                for nome_destinatario in subscricoes.get(topico, []):
+                    if nome_destinatario == id_cliente:
+                        continue
+                    caminho_chave = f"certs/pub_keys/{nome_destinatario}_pub.pem"
+                    if not os.path.exists(caminho_chave):
+                        print(f"[DEBUG] Chave pública não encontrada para {nome_destinatario}")
+                        continue
+                    try:
+                        chave_pub = carregar_chave_publica_pem(caminho_chave)
+                        print(f"[DEBUG] Chave pública de {nome_destinatario} carregada, tipo: {type(chave_pub)}")
+                        chave_aes = gerar_chave_aes()
+                        msg_criptografada = criptografar_aes(mensagem, chave_aes)
+                        chave_aes_cript, ephemeral_public_key = criptografar_ec(chave_aes, chave_pub)
+                        pacote_pub = json.dumps({
+                            "tipo": "mensagem",
+                            "topico": topico,
+                            "mensagem": {
+                                "aes": chave_aes_cript.hex(),
+                                "msg": msg_criptografada.hex(),
+                                "ephemeral_public_key": ephemeral_public_key.public_bytes(
+                                    encoding=serialization.Encoding.PEM,
+                                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                                ).decode()
+                            },
+                            "id": id_cliente,
+                            "destinatario": nome_destinatario
+                        })
+                        if nome_destinatario in clientes_conectados:
+                            try:
+                                clientes_conectados[nome_destinatario].send(pacote_pub.encode())
+                                print(f"[{topico}] {id_cliente} → {nome_destinatario}")
+                            except socket.error as se:
+                                print(f"[ERRO] Falha ao enviar mensagem para {nome_destinatario}: {se}")
+                        else:
+                            print(f"[DEBUG] Cliente {nome_destinatario} não está conectado")
+                    except Exception as e:
+                        print(f"[ERRO] Falha ao publicar para {nome_destinatario}: {e}")
 
     except Exception as e:
         print(f"[!] Erro com cliente {addr}: {e}")
     finally:
         if id_cliente and id_cliente in clientes_conectados:
+            print(f"[DEBUG] Removendo cliente {id_cliente} da lista de conectados")
             del clientes_conectados[id_cliente]
         conn.close()
+        print(f"[DEBUG] Conexão com {addr} fechada")
 
 def iniciar_broker():
     servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    servidor.bind((BROKER_HOST, BROKER_PORT))
-    servidor.listen(5)
-    print(f"[*] Broker ouvindo em {BROKER_HOST}:{BROKER_PORT}")
+    servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Permitir reutilização de endereço
+    try:
+        servidor.bind((BROKER_HOST, BROKER_PORT))
+        servidor.listen(5)
+        print(f"[*] Broker ouvindo em {BROKER_HOST}:{BROKER_PORT}")
+    except Exception as e:
+        print(f"[ERRO] Falha ao iniciar o broker: {e}")
+        return
 
     while True:
-        conn, addr = servidor.accept()
-        threading.Thread(target=tratar_cliente, args=(conn, addr)).start()
+        try:
+            conn, addr = servidor.accept()
+            threading.Thread(target=tratar_cliente, args=(conn, addr)).start()
+        except Exception as e:
+            print(f"[ERRO] Falha ao aceitar conexão: {e}")
 
 if __name__ == '__main__':
     iniciar_broker()
