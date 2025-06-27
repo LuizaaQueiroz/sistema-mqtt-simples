@@ -11,6 +11,7 @@ from utils.crypto_utils import (
     criptografar_ec
 )
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.backends import default_backend
 
 BROKER_HOST = 'localhost'
@@ -37,11 +38,12 @@ def tratar_cliente(conn, addr):
                 with open(chave_path, "wb") as f:
                     chave_data = chave_publica.encode() if isinstance(chave_publica, str) else chave_publica
                     f.write(chave_data)
-                # Validar a chave salva
                 with open(chave_path, "rb") as f:
                     key = serialization.load_pem_public_key(f.read(), default_backend())
-                    print(f"[DEBUG] Chave pública de {id_cliente} carregada, tipo: {type(key)}")
-                print(f"[✓] Cliente autenticado: {id_cliente}, chave pública validada")
+                    print(f"[DEBUG] Chave pública de {id_cliente} carregada, tipo: {type(key)}, caminho: {chave_path}")
+                    if not isinstance(key, ec.EllipticCurvePublicKey):
+                        raise ValueError(f"Chave de {id_cliente} não é EC: {type(key)}")
+                print(f"[✓] Cliente autenticado: {id_cliente}")
                 clientes_conectados[id_cliente] = conn
                 conn.send(b"AUTENTICADO")
             except Exception as e:
@@ -62,7 +64,9 @@ def tratar_cliente(conn, addr):
                 topico = pacote['topico']
                 if id_cliente not in subscricoes.setdefault(topico, []):
                     subscricoes[topico].append(id_cliente)
-                print(f"[+] {id_cliente} inscrito em {topico}")
+                    print(f"[+] {id_cliente} inscrito em {topico}")
+                else:
+                    print(f"[DEBUG] {id_cliente} já inscrito em {topico}")
 
             elif tipo == 'publicar':
                 topico = pacote['topico']
@@ -74,11 +78,13 @@ def tratar_cliente(conn, addr):
                         continue
                     caminho_chave = f"certs/pub_keys/{nome_destinatario}_pub.pem"
                     if not os.path.exists(caminho_chave):
-                        print(f"[DEBUG] Chave pública não encontrada para {nome_destinatario}")
+                        print(f"[DEBUG] Chave pública não encontrada para {nome_destinatario} em {caminho_chave}")
                         continue
                     try:
                         chave_pub = carregar_chave_publica_pem(caminho_chave)
-                        print(f"[DEBUG] Chave pública de {nome_destinatario} carregada, tipo: {type(chave_pub)}")
+                        print(f"[DEBUG] Chave pública de {nome_destinatario} carregada, tipo: {type(chave_pub)}, caminho: {caminho_chave}")
+                        if not isinstance(chave_pub, ec.EllipticCurvePublicKey):
+                            raise ValueError(f"Chave de {nome_destinatario} não é EC: {type(chave_pub)}")
                         chave_aes = gerar_chave_aes()
                         msg_criptografada = criptografar_aes(mensagem, chave_aes)
                         chave_aes_cript, ephemeral_public_key = criptografar_ec(chave_aes, chave_pub)
@@ -113,12 +119,17 @@ def tratar_cliente(conn, addr):
         if id_cliente and id_cliente in clientes_conectados:
             print(f"[DEBUG] Removendo cliente {id_cliente} da lista de conectados")
             del clientes_conectados[id_cliente]
+            # Remover cliente de todas as subscrições
+            for topico in subscricoes:
+                if id_cliente in subscricoes[topico]:
+                    subscricoes[topico].remove(id_cliente)
+            print(f"[DEBUG] {id_cliente} removido das subscrições")
         conn.close()
         print(f"[DEBUG] Conexão com {addr} fechada")
 
 def iniciar_broker():
     servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Permitir reutilização de endereço
+    servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         servidor.bind((BROKER_HOST, BROKER_PORT))
         servidor.listen(5)
